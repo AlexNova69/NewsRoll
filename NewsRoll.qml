@@ -27,13 +27,21 @@ import QtQuick 2.3
         и следующие 2–3 строки.
      3. Когда блок закончился и в файле идёт новый '#...' — заголовок
         меняется (анимация затемнения), показ блока повторяется.
-     4. После последнего блока показ начинается заново (loopPlayback).
+     4. После последней страницы показ ЗАВЕРШАЕТСЯ: скрипт не играет
+        «по кольцу», а замерзает на последней странице (loopPlayback
+        по умолчанию false).
 
    ВЫХОД В ЭФИР: задание движок загружает заранее, поэтому скрипт следит
    за статусом SLRunTime.statusElement (4 = «Running») и при КАЖДОМ
-   входе в эфир начинает цикл заново — первая страница всегда показывается
-   полное время. По желанию включается заставка splashDurationMs
+   входе в эфир начинает цикл заново — всегда с заставки и первой
+   страницы. По желанию включается заставка splashDurationMs
    (по типу WeatherRoll; 0 — выключена).
+
+   ТАЙМИНГ — архитектура в точности как в WeatherRoll (проверена этим
+   же движком в эфире): выдержки страниц и заставка — обычные Timer
+   по настенным часам, рестарт цикла на каждый выход в эфир, без
+   дебаунса и парковки. Слот страницы = время от её появления до
+   следующей и ВКЛЮЧАЕТ переход (см. holdTimeFor).
 
    Вариант смены страниц задаётся свойством transitionStyle:
      "flip"       — переворот вокруг горизонтальной оси (по умолчанию);
@@ -57,10 +65,13 @@ Item {
     //  титровального элемента QML)
     property string newsFileUrl: "file:///D:/Project/newsroll/пикалево.txt"
 
-    // Время показа ПЕРВОЙ страницы блока (3 предложения), мс
+    // СЛОТ первой страницы блока (3 предложения), мс: время от появления
+    // страницы до следующей — ВКЛЮЧАЯ переход. «9 секунд» = страница
+    // видна 9 секунд ровно от края до края.
     property int showTimeFirstMs: 12000
 
-    // Время показа СЛЕДУЮЩИХ страниц блока (2–3 предложения), мс
+    // СЛОТ следующих страниц блока (2–3 предложения), мс (так же включает
+    // переход)
     property int showTimeRestMs: 9000
 
     // Вариант смены страниц: "flip" | "slideLeft" | "slideRight" |
@@ -73,8 +84,11 @@ Item {
     // Длительность анимации смены заголовка '#...', мс
     property int headerSwapMs: 300
 
-    // Зацикливание показа (по кругу); false — остаться на последней странице
-    property bool loopPlayback: true
+    // Зацикливание показа (по кругу). Внимание: по умолчанию ВЫКЛЮЧЕНО —
+    // после последней страницы показ завершается и элемент паркуется
+    // на заставке (требование эфира: показ не «крутится по кольцу»).
+    // true — крутить по кругу без остановки.
+    property bool loopPlayback: false
 
     // Предложений на первой странице блока
     property int sentencesOnFirstPage: 3
@@ -90,6 +104,39 @@ Item {
     // Заставка в начале цикла показа, мс (по типу WeatherRoll).
     // 0 — выключена; включённая ограничивается диапазоном 3000..8000.
     property int splashDurationMs: 3000
+
+    readonly property int splashClampedMs:
+        (splashDurationMs > 0) ? Math.min(8000, Math.max(3000, splashDurationMs)) : 0
+
+    // Минимум статичного показа страницы внутри слота (защита от слишком
+    // коротких слотов: слот обязан вмещать переход + minVisibleMs)
+    property int minVisibleMs: 500
+
+    // Видео-заставка в начале показа (по схеме WeatherRoll). Пусто —
+    // статическая заставка «НОВОСТИ». Длительность задания учитывает
+    // длину видео автоматически.
+    property string introVideoUrl: ""
+    property real introVideoVolume: 1.0
+
+    // Оформление СТАТИЧЕСКОЙ заставки:
+    //   splashText — свой текст вместо «НОВОСТИ» (можно несколько слов);
+    //   splashLogoUrl — картинка-логотип вместо пульсирующего кольца;
+    //   splashBackgroundUrl — фоновая картинка заставки (тёмно-синий цвет
+    // остаётся подложкой; при ошибке загрузки всё откатывается к умолчанию).
+    property string splashText: "НОВОСТИ"   // «НОВОСТИ»
+    property string splashLogoUrl: ""
+    property string splashBackgroundUrl: ""
+    property color splashTextColor: "#FFFFFFFF"
+
+    // Мультимедиа-компонент загружается через Loader (NewsRollAV.qml);
+    // если QtMultimedia недоступен — откат на статическую заставку
+    property bool avAvailable: false
+    property bool avTried: false
+
+    // Экранная строка-индикатор в правом нижнем углу: готовая длительность
+    // цикла (для окна titleon) и счётчик включений. ВЫКЛЮЧАЕТСЯ в
+    // NewsRoll.ini: showDebugOverlay = false
+    property bool showDebugOverlay: true
 
     // Файл настроек NewsRoll.ini (ищется рядом с NewsRoll.qml).
     // Значения из ini переопределяют значения по умолчанию, заданные
@@ -143,56 +190,105 @@ Item {
     property string _summary: "не загружено"
     property bool _transitionActive: false
     property bool splashActive: false
+    property int _holdMs: 12000        // текущее время удержания страницы
+    property real _holdStart: 0        // Date.now() старта выдержки (настенные часы)
+    property real _splashStart: 0      // Date.now() старта заставки
+    property int _earlyFires: 0        // сколько раз движок срабатывал по таймеру раньше времени
 
     // ДЛИТЕЛЬНОСТЬ ЗАДАНИЯ — один цикл показа, мс: заставка (если
-    // включена) + страницы и переходы.
+    // включена) + слоты всех страниц (слот включает переход).
+    // ФОРМУЛА: цикл = заставка + Σ (слот страницы);
+    //   одно СМИ = showTimeFirstMs + (страниц-1) × showTimeRestMs.
+    //   Пример: 3 СМИ по 5 строк (2 страницы), 9000/9000, заставка 3000:
+    //   цикл = 3000 + 3 × (9000 + 9000) = 57000 мс = 0:57 РОВНО.
     property int duration: {
-        var total = (splashDurationMs > 0)
-                    ? Math.min(8000, Math.max(3000, splashDurationMs)) : 0
+        var total = splashPartMs
         for (var i = 0; i < schedule.length; i++)
-            total += holdTimeFor(schedule[i])
-        if (schedule.length > 1)
-            total += (loopPlayback ? schedule.length : schedule.length - 1)
-                     * transitionDurationMs
+            total += slotTimeFor(schedule[i])
         return total
     }
+
+    // Заставка в формуле длительности: длина видео (если загружено и
+    // известна) либо статическая выдержка
+    readonly property int splashPartMs:
+        (avAvailable && introVideoUrl !== "" &&
+         avLoader.item && avLoader.item.introDurationMs > 0)
+        ? avLoader.item.introDurationMs : splashClampedMs
 
     /* ---------- ВЫХОД В ЭФИР: цикл каждый раз с первой страницы ---------- */
 
     // Задание движок загружает ЗАРАНЕЕ, поэтому таймеры скрипта стартуют
     // до эфира и первая страница «проскакивает». Скрипт опрашивает статус
-    // SLRunTime.statusElement (4 = «Running», как в референсных элементах
-    // SoftLab) и при КАЖДОМ входе в эфир перезапускает цикл с начала.
-    // В автономном запуске SLRunTime нет — показ идёт сразу.
+    // SLRunTime.statusElement (4 = «Running») и при КАЖДОМ входе в эфир
+    // перезапускает цикл с начала. В автономном запуске SLRunTime нет —
+    // показ идёт сразу.
+    //
+    // АРХИТЕКТУРА ВРЕМЕНИ — в точности как в WeatherRoll (проверено в
+    // этом же движке): удержания страниц и заставка — обычные Timer
+    // (настенные часы), рестарт на каждый выход в эфир, БЕЗ дебаунса
+    // и БЕЗ парковки. После последней страницы показ завершается —
+    // элемент замерзает на последней странице («конец работы»).
     property bool elementRunning: false      // диагностика
     property bool _airStarted: false
+    property int airRestarts: 0              // сколько раз движок включал элемент (диагностика)
+    property int _lastStatus: -1             // для журнала изменений статуса
+    property real _showStartWall: 0          // Date.now() последнего старта показа
+
+    // Подавление рестартов сразу после старта показа: в моде «Файл» движок
+    // готовит клип, прогоняя живой QML, и статус элемента при этом
+    // читается как «Running» — без защиты рестарт посреди подготовки портил
+    // записанный клип (первая страница обрезалась до ~1 с). Реальные
+    // включения разнесены на десятки секунд — для них guard не мешает.
+    property int airRestartGuardMs: 15000
+
 
     Timer {
         id: airPollTimer
-        interval: 400
+        // 500 мс, как в WeatherRoll: каждое чтение SLRunTime.statusElement —
+        // межпроцессный COM-вызов во внешний движок; частый опрос перегружал
+        // RPC-связь (в журнале FDOnAir — «Сервер RPC недоступен»)
+        interval: 500
         repeat: true
         running: true
         onTriggered: root.pollRuntime()
     }
 
     function pollRuntime() {
+        // ОДИН дешёвый доступ к свойству. Не использовать hasOwnProperty:
+        // на C++-обёртке SLRunTime он перечисляет ВСЕ свойства и дёргает
+        // тяжёлые геттеры движка (в журнале FDOnAir это выглядело как
+        // ISLTMTitleRunTime4.get_TaskFileName() по 312 мс и Watchdog 3 c).
+        var st
         try {
-            if (typeof SLRunTime === "undefined") return
-            if (!SLRunTime.hasOwnProperty("statusElement")) return
-            var r = (SLRunTime.statusElement === 4)
-            elementRunning = r
-            if (!r) {
-                _airStarted = false              // вышли из эфира
-            } else if (!_airStarted) {
-                _airStarted = true
-                restartForAir()
+            st = SLRunTime.statusElement
+        } catch (e) {
+            return                          // SLRunTime нет — автономный запуск
+        }
+        if (st !== _lastStatus) {           // журнал: каждое изменение статуса
+            console.log("NewsRoll: statusElement " + _lastStatus + " -> " + st)
+            _lastStatus = st
+        }
+        var r = (st === 4)
+        elementRunning = r
+        if (!r) {
+            _airStarted = false             // вышли из эфира
+        } else if (!_airStarted) {
+            _airStarted = true
+            if (Date.now() - _showStartWall < airRestartGuardMs) {
+                console.log("NewsRoll: рестарт подавлен — идёт подготовка" +
+                            " (первые " + airRestartGuardMs + " мс показа)")
+            } else {
+                restartForAir()             // реальное включение в эфир
             }
-        } catch (e) { }
+        }
     }
 
     function restartForAir() {
-        console.log("NewsRoll: выход в эфир — цикл с первой страницы," +
-                    " длительность задания = " + duration + " мс")
+        airRestarts++
+        console.log("NewsRoll: выход в эфир — цикл с первой страницы." +
+                    " Длительность: заставка " + splashClampedMs + " мс + " +
+                    schedule.length + " страниц = " + duration + " мс (" +
+                    fmtMs(duration) + "). Окно titleon ставьте не меньше.")
         startShow()
     }
 
@@ -200,7 +296,40 @@ Item {
     readonly property string debugSummary: _summary
 
     function holdTimeFor(step) {
+        // Слот страницы = время от её появления до появления следующей
+        // (ЖЁСТКО равен showTime*Ms и ВКЛЮЧАЕТ длительность перехода).
+        // Выдержка статичного показа = слот - transitionDurationMs.
+        var hold = slotTimeFor(step) - transitionDurationMs
+        var minHold = transitionDurationMs + minVisibleMs
+        if (hold < minHold)
+            hold = minHold      // слот меньше перехода + minVisibleMs — тянем
+        return hold
+    }
+
+    function slotTimeFor(step) {
         return (step && step.rest) ? showTimeRestMs : showTimeFirstMs
+    }
+
+    // мс -> "м:сс" для журнала
+    function fmtMs(ms) {
+        var s = Math.round(ms / 1000)
+        var m = Math.floor(s / 60)
+        s -= m * 60
+        return m + ":" + ((s < 10) ? "0" : "") + s
+    }
+
+    // Запуск удержания текущей страницы. Обычный Timer, но с контрольной
+    // точкой по настенным часам (см. holdTimer) — движок не может «съесть»
+    // время показа, разгоняя событийный цикл.
+    function startHold(step) {
+        var slot = slotTimeFor(step)
+        if (slot < transitionDurationMs + minVisibleMs)
+            console.log("NewsRoll: ВНИМАНИЕ: слот " + slot + " мс меньше перехода+" +
+                        minVisibleMs + " мс — фактический слот растянут до " +
+                        (transitionDurationMs + minVisibleMs + transitionDurationMs) + " мс")
+        _holdMs = Math.max(1, holdTimeFor(step))
+        _holdStart = Date.now()
+        holdTimer.restart()
     }
 
     /* ==================== РАЗБОР ФАЙЛА ==================== */
@@ -266,8 +395,15 @@ Item {
                 first = false
             }
         }
+        // длительность = заставка + слоты всех страниц (слот включает переход)
+        var dur = splashClampedMs
+        for (var d = 0; d < sch.length; d++)
+            dur += (sch[d].rest ? showTimeRestMs : showTimeFirstMs)
         _summary = "блоков=" + blocks.length + "; страниц=" + sch.length +
-                   "; предложений=" + total
+                   "; предложений=" + total + "; длительность=" + dur +
+                   " мс (" + fmtMs(dur) + ")"
+        console.log("NewsRoll: задание разобрано — " + _summary +
+                    ". Ставьте окно titleon = этой длительности.")
         return sch
     }
 
@@ -278,9 +414,16 @@ Item {
     }
 
     // Если движок ForwardT передаёт содержимое файла «Задание» в QML
-    // через свойство контекста — используем его (пробуем типовые имена;
-    // отсутствие свойства не является ошибкой).
+    // через свойство контекста — используем его. По умолчанию ВЫКЛЮЧЕНО:
+    // каждая проба имён читает свойства C++-обёртки движка (в журнале
+    // FDOnAir это давало ISLTMTitleRunTime4.get_TaskFileName() по 312 мс
+    // и перегрузку цикла событий). Включайте, только если проверили,
+    // что канал данных действительно работает.
+    property bool useInjectedTask: false
+
     function injectedTaskText() {
+        if (!useInjectedTask)
+            return ""
         var v
         try { v = Data;       if (typeof v === "string" && v.length > 0) return v } catch (e) {}
         try { v = Task;       if (typeof v === "string" && v.length > 0) return v } catch (e) {}
@@ -297,8 +440,7 @@ Item {
             loadError = ""
             var sch0 = parseNews(injected)
             if (!keepPage || JSON.stringify(sch0) !== JSON.stringify(schedule)) {
-                schedule = sch0
-                startShow()
+                applySchedule(sch0)
             }
             return
         }
@@ -317,14 +459,12 @@ Item {
                 loadError = ""
                 var newSch = parseNews(txt)
                 if (!keepPage) {
-                    schedule = newSch
-                    startShow()
+                    applySchedule(newSch)
                 } else if (JSON.stringify(newSch) !== JSON.stringify(schedule)) {
                     // перечитывание по таймеру: если содержимое изменилось —
-                    // показ начинается заново, иначе продолжается как было
+                    // показ перезапускается, иначе продолжается как было
                     console.log("NewsRoll: файл изменён, показ перезапущен")
-                    schedule = newSch
-                    startShow()
+                    applySchedule(newSch)
                 }
             }
         }
@@ -369,6 +509,11 @@ Item {
             headerSwapMs: "int",       loopPlayback: "bool",
             sentencesOnFirstPage: "int", sentencesOnNextPage: "int",
             reloadIntervalMs: "int",   splashDurationMs: "int",
+            useInjectedTask: "bool",   showDebugOverlay: "bool",
+            introVideoUrl: "string",  introVideoVolume: "real",
+            airRestartGuardMs: "int",
+            splashText: "string",       splashLogoUrl: "string",
+            splashBackgroundUrl: "string", splashTextColor: "color",
             fontFamily: "string",      enableOutline: "bool",
             panelColor: "color",       panelBorderColor: "color",
             headerBgColor: "color",    headerTextColor: "color",
@@ -397,6 +542,9 @@ Item {
             } else if (t === "int") {
                 var n = parseInt(val, 10)
                 if (!isNaN(n)) root[key] = n
+            } else if (t === "real") {
+                var f = parseFloat(val)
+                if (!isNaN(f)) root[key] = f
             } else {
                 root[key] = val
             }
@@ -413,13 +561,29 @@ Item {
                 try { applySettingsIni(txt) } catch (e) {
                     console.log("NewsRoll: ошибка NewsRoll.ini: " + e)
                 }
-                loadNews(false)
+                bootAfterSettings()
             },
             function () {
                 console.log("NewsRoll: NewsRoll.ini не найден или пуст —" +
                             " используются значения свойств из QML")
-                loadNews(false)
+                bootAfterSettings()
             })
+    }
+
+    // Загрузка мультимедиа-компонента для видео-заставки (как WeatherRoll):
+    // при наличии introVideoUrl подключаем NewsRollAV.qml; исход (загружен
+    // или нет) сокращает ожидание avBootTimer. Без видео — сразу данные.
+    function bootAfterSettings() {
+        if (!avTried) {
+            avTried = true
+            if (introVideoUrl !== "") {
+                avLoader.source = "NewsRollAV.qml"
+                avBootTimer.interval = 1500        // максимум на загрузку
+                avBootTimer.restart()
+                return
+            }
+        }
+        loadNews(false)
     }
 
     // Периодическое обновление: сначала настройки, затем данные
@@ -432,32 +596,54 @@ Item {
             function () { loadNews(true) })
     }
 
-    // Начало показа: заставка (если включена), затем первая страница
+    // Применить новое расписание и начать показ заново (как WeatherRoll)
+    function applySchedule(sch) {
+        schedule = sch
+        startShow()
+    }
+
+    // Начало показа: видео-заставка (если задана и доступна) ->
+    // по окончании видео beginShow(); иначе статическая заставка ->
+    // первая страница (схема WeatherRoll)
     function startShow() {
-        if (splashDurationMs > 0) {
-            showSplash()
+        _showStartWall = Date.now()
+        if (avAvailable && introVideoUrl !== "") {
+            _transitionActive = false
+            holdTimer.stop()
+            splashTimer.stop()
+            flipAnim.stop()
+            slideAnim.stop()
+            splashActive = false
+            root.opacity = 1          // видео показываем без проявления
+            avLoader.item.playIntro(introVideoUrl)
+            return
+        }
+        if (splashClampedMs > 0) {
+            showSplash(true)
             return
         }
         beginShow()
     }
 
-    function showSplash() {
-        holdTimer.stop()
-        flipAnim.stop()
+    function showSplash(withFade) {
+        _transitionActive = false   // до stop() — onStopped срабатывает
+        holdTimer.stop()            // синхронно и иначе transitionFinished
+        flipAnim.stop()             // успевает пролезть с мусорным idx
         slideAnim.stop()
-        _transitionActive = false
-        introAnim.restart()      // проявить корень: заставка внутри него,
-        splashActive = true      // иначе она невидима при opacity: 0
-        splashTimer.restart()
+        if (withFade)
+            introAnim.restart()      // проявить корень: заставка внутри него,
+        splashActive = true          // иначе она невидима при opacity: 0
+        _splashStart = Date.now()
+        splashTimer.restart()        // выдержка заставки + защита по часам
     }
 
     function beginShow() {
+        _transitionActive = false   // до stop() — см. комментарий выше
         splashActive = false
         splashTimer.stop()
         holdTimer.stop()
         flipAnim.stop()
         slideAnim.stop()
-        _transitionActive = false
         frontIsA = true
         pageA.x = 0; pageA.y = 0
         pageB.x = 0; pageB.y = 0
@@ -476,6 +662,15 @@ Item {
         introAnim.restart()
     }
 
+    // Откат с видео-заставки на статическую (нет мультимедиа/ошибка файла)
+    function introVideoFailed(message) {
+        console.log("NewsRoll: видео-заставка недоступна (" + message +
+                    ") — статическая заставка")
+        if (avLoader.item)
+            avLoader.item.stopAll()
+        showSplash(true)
+    }
+
     // Немедленно показать шаг idx (без анимации)
     function applyStep(idx) {
         var step = schedule[idx]
@@ -483,8 +678,23 @@ Item {
         currentHeader = step.header
         headerText.text = step.header
         pageA.setLines(step.lines)
-        holdTimer.interval = holdTimeFor(step)
-        holdTimer.restart()
+        startHold(step)
+        prewarm()
+    }
+
+    // Прогрев: заранее наполняем скрытую страницу следующим шагом,
+    // чтобы к началу перехода текстовые элементы уже были созданы и
+    // свёрстаны (убирает «тормоз» первого переворота/слайда).
+    function prewarm() {
+        if (schedule.length < 2)
+            return
+        var n = currentIdx + 1
+        if (n >= schedule.length)
+            n = loopPlayback ? 0 : -1
+        if (n < 0)
+            return
+        var inPage = frontIsA ? pageB : pageA
+        inPage.setLines(schedule[n].lines)
     }
 
     /* ==================== СМЕНА СТРАНИЦ ==================== */
@@ -494,8 +704,13 @@ Item {
             return
         var next = currentIdx + 1
         if (next >= schedule.length) {
-            if (!loopPlayback)
-                return                          // остаёмся на последней странице
+            if (!loopPlayback) {
+                // показ завершён: все страницы показаны — конец работы,
+                // элемент замерзает на последней странице (как WeatherRoll:
+                // дальше ждёт рестарта по следующему выходу в эфир)
+                console.log("NewsRoll: показ завершён — все страницы показаны")
+                return
+            }
             next = 0
         }
         doTransition(next)
@@ -570,8 +785,8 @@ Item {
         currentIdx = (currentIdx + 1) % schedule.length
         var step = schedule[currentIdx]
         currentHeader = step.header
-        holdTimer.interval = holdTimeFor(step)
-        holdTimer.restart()
+        startHold(step)
+        prewarm()
     }
 
     property bool frontIsA: true
@@ -752,6 +967,61 @@ Item {
         color: errorColor
     }
 
+    // --- экранный индикатор-самописец (showDebugOverlay = true в ini) ---
+    // Две строки в правом нижнем углу: ЖИВОЕ состояние (заставка/страница,
+    // слот, сколько реально прошло по настенным часам, счётчик
+    // преждевременных срабатываний таймера) и длительность цикла.
+    // Достаточно фотографии экрана, чтобы поставить диагноз.
+    property int _uiTick: 0        // тикер для автообновления индикатора
+
+    Timer {
+        interval: 200
+        running: root.showDebugOverlay
+        repeat: true
+        onTriggered: root._uiTick++
+    }
+
+    function debugLine() {
+        var tick = _uiTick                 // зависимость: обновляется 5 раз/с
+        if (splashActive)
+            return "ЗАСТАВКА " + ((Date.now() - _splashStart) / 1000).toFixed(1) +
+                   " с · ранних срабатываний: " + _earlyFires
+        var idx = currentIdx
+        var slot = (idx >= 0 && idx < schedule.length && schedule[idx].rest)
+                    ? showTimeRestMs : showTimeFirstMs
+        return "стр. " + (idx + 1) + "/" + schedule.length + " · слот " + slot +
+               " · прошло " + ((Date.now() - _holdStart) / 1000).toFixed(1) +
+               " с · ранних срабатываний: " + _earlyFires
+    }
+
+    Column {
+        visible: root.showDebugOverlay
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        anchors.margins: Math.max(4, Math.round(6 * root.k))
+        spacing: 2
+        z: 20
+
+        Text {
+            text: root.debugLine()
+            font.family: root.fontFamily
+            font.pixelSize: Math.max(10, Math.round(12 * root.k))
+            color: "#FFFFC9A3"
+            style: Text.Outline
+            styleColor: root.outlineColor
+        }
+        Text {
+            text: "цикл " + root.fmtMs(root.duration) + " = заставка " +
+                  root.splashClampedMs + " + " + root.schedule.length +
+                  " стр. | включений: " + root.airRestarts
+            font.family: root.fontFamily
+            font.pixelSize: Math.max(10, Math.round(11 * root.k))
+            color: "#FFFFFFFF"
+            style: Text.Outline
+            styleColor: root.outlineColor
+        }
+    }
+
     // --- заставка (по типу WeatherRoll) ---
     Item {
         id: staticSplash
@@ -759,14 +1029,36 @@ Item {
         visible: root.splashActive
         z: 10
 
+        // подложка-цвет + необязательная фоновая картинка заставки
         Rectangle { anchors.fill: parent; color: "#FF0B1B33"; radius: radiusPx }
+        Image {
+            anchors.fill: parent
+            visible: (status === Image.Ready)
+            source: (root.splashBackgroundUrl !== "") ? root.splashBackgroundUrl : ""
+            fillMode: Image.PreserveAspectCrop
+            asynchronous: true
+        }
 
         Column {
             anchors.centerIn: parent
             spacing: Math.round(26 * root.k)
 
+            // Логотип-картинка (если задан и загрузился) вместо кольца
+            Image {
+                id: splashLogo
+                visible: (status === Image.Ready)
+                anchors.horizontalCenter: parent.horizontalCenter
+                source: (root.splashLogoUrl !== "") ? root.splashLogoUrl : ""
+                fillMode: Image.PreserveAspectFit
+                width: Math.round(140 * root.k)
+                height: Math.round(140 * root.k)
+                asynchronous: true
+            }
+
+            // Пульсирующее кольцо — когда логотипа нет
             Rectangle {
                 id: pulseRing
+                visible: !splashLogo.visible
                 width: Math.round(120 * root.k)
                 height: width
                 radius: width / 2
@@ -777,7 +1069,7 @@ Item {
 
                 SequentialAnimation {
                     id: pulseAnim
-                    running: root.splashActive
+                    running: root.splashActive && pulseRing.visible
                     loops: Animation.Infinite
                     NumberAnimation { target: pulseRing; property: "scale"; from: 0.85; to: 1.15; duration: 900; easing.type: Easing.InOutQuad }
                     NumberAnimation { target: pulseRing; property: "scale"; from: 1.15; to: 0.85; duration: 900; easing.type: Easing.InOutQuad }
@@ -785,19 +1077,20 @@ Item {
 
                 Text {
                     anchors.centerIn: parent
-                    text: "\u2739"
+                    text: "✹"
                     color: root.accentColor
                     font.pixelSize: Math.round(48 * root.k)
                 }
             }
 
+            // Текст заставки — задаётся пользователем (splashText)
             Text {
-                text: "\u041D\u041E\u0412\u041E\u0421\u0422\u0418"   // «НОВОСТИ»
+                text: root.splashText
                 anchors.horizontalCenter: parent.horizontalCenter
                 font.family: root.fontFamily
                 font.pixelSize: Math.round(52 * root.k)
                 font.bold: true
-                color: "#FFFFFFFF"
+                color: root.splashTextColor
                 style: Text.Outline
                 styleColor: root.outlineColor
             }
@@ -871,19 +1164,48 @@ Item {
         }
     }
 
-    // Время удержания текущей страницы
+    // Время удержания страницы — Timer + СВЕРКА С НАСТЕННЫМИ ЧАСАМИ.
+    // FDOnAir при включении титула может разгонять событийный цикл QML,
+    // и таймер срабатывает по «движковому» времени раньше положенного —
+    // из-за этого первая страница переворачивалась через ~1 секунду.
+    // Если таймер пришёл раньше 80% выдержки — додерживаем остаток.
     Timer {
         id: holdTimer
-        interval: showTimeFirstMs
+        objectName: "holdTimer"
+        interval: Math.max(1, root._holdMs)
         repeat: false
-        onTriggered: root.advance()
+        onTriggered: {
+            var elapsed = Date.now() - root._holdStart
+            if (elapsed < root._holdMs * 0.95) {
+                root._earlyFires++
+                console.log("NewsRoll: таймер страницы сработал раньше времени " +
+                            "(прошло " + Math.round(elapsed) + " из " + root._holdMs +
+                            " мс) — додерживаем остаток")
+                holdTimer.interval = Math.max(50, root._holdMs - elapsed)
+                holdTimer.start()
+                return
+            }
+            root.advance()
+        }
     }
 
-    // Статическая заставка (3–8 секунд, ограничение как в WeatherRoll)
+    // Заставка — та же защита по настенным часам
     Timer {
         id: splashTimer
-        interval: Math.min(8000, Math.max(3000, splashDurationMs))
-        onTriggered: root.beginShow()
+        interval: root.splashClampedMs
+        repeat: false
+        onTriggered: {
+            var spElapsed = Date.now() - root._splashStart
+            if (spElapsed < root.splashClampedMs * 0.95) {
+                console.log("NewsRoll: таймер заставки сработал раньше времени " +
+                            "(прошло " + Math.round(spElapsed) + " из " +
+                            root.splashClampedMs + " мс) — додерживаем")
+                splashTimer.interval = Math.max(50, root.splashClampedMs - spElapsed)
+                splashTimer.start()
+                return
+            }
+            root.beginShow()
+        }
     }
 
     // Периодическое перечитывание (reloadIntervalMs > 0):
@@ -896,8 +1218,50 @@ Item {
         onTriggered: root.reloadAll()
     }
 
+    // Мультимедиа-компонент видео-заставки (Loader, как в WeatherRoll):
+    // недоступность QtMultimedia -> Loader.Error -> статическая заставка
+    Loader {
+        id: avLoader
+        anchors.fill: parent
+        z: 15
+        onStatusChanged: {
+            if (status === Loader.Ready) {
+                root.avAvailable = true
+                root.avTried = true
+                avBootTimer.interval = 50
+                avBootTimer.restart()
+            } else if (status === Loader.Error) {
+                root.avAvailable = false
+                root.avTried = true
+                console.log("NewsRoll: QtMultimedia недоступен —" +
+                            " видео-заставка отключена")
+                avBootTimer.interval = 50
+                avBootTimer.restart()
+            }
+        }
+    }
+
+    // Ожидание загрузки мультимедиа-компонента (не более 1,5 с)
+    Timer {
+        id: avBootTimer
+        interval: 1500
+        onTriggered: root.bootAfterSettings()
+    }
+
+    // Сигналы от NewsRollAV.qml: конец видео -> показ новостей;
+    // ошибка видео -> откат на статическую заставку
+    Connections {
+        target: avLoader.item
+        onIntroFinished: root.beginShow()
+        onMediaError: {
+            console.log("NewsRoll: ошибка мультимедиа (" + tag + "): " + message)
+            if (tag === "intro")
+                root.introVideoFailed(message)
+        }
+    }
+
     Component.onCompleted: {
         console.log("NewsRoll: загрузка " + newsFileUrl)
-        loadSettings()      // ini -> загрузка данных
+        loadSettings()      // ini -> (видео-компонент) -> загрузка данных
     }
 }
